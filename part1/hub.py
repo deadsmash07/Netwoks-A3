@@ -20,15 +20,14 @@ class HubController(app_manager.RyuApp):
         parser = dp.ofproto_parser
         in_port = msg.in_port  # For OFP v1.0, the field is msg.in_port, not msg.match['in_port']
         
-        # Get the packet data
+        # getting the packet data
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
         
-        # Ignore LLDP packets
         if eth.ethertype == 0x88cc:
             return
 
-        # Flood the packet to all ports
+        # flooding the packet to all ports
         actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         
         # Create the PacketOut message
