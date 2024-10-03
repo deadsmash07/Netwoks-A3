@@ -47,4 +47,4 @@ if __name__ == '__main__':
     # Set log level to display Mininet output
     setLogLevel('info')
     run()
-topos = {'customtopo': (lambda: CustomTopo())}
+topos = {'customtopo1': (lambda: CustomTopo())}
