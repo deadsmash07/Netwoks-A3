@@ -1,3 +1,5 @@
+#!/usr/bin/python
+
 from mininet.topo import Topo
 from mininet.net import Mininet
 from mininet.node import OVSSwitch, RemoteController
@@ -35,7 +37,7 @@ class CustomTopo(Topo):
 def run():
     """Create the network, start it, and enter the CLI."""
     topo = CustomTopo()
-    net = Mininet(topo=topo, switch=OVSSwitch, build=False, autoSetMacs=True)
+    net = Mininet(topo=topo, switch=OVSSwitch, build=False)
     net.addController('c0', controller=RemoteController, ip="127.0.0.1", protocol='tcp', port=6633)
     net.build()
     net.start()
@@ -50,4 +52,3 @@ if __name__ == '__main__':
     # Set log level to display Mininet output
     setLogLevel('info')
     run()
-topos = {'customtopo2': (lambda: CustomTopo())}
