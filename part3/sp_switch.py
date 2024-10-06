@@ -77,7 +77,7 @@ class ShortestPathSwitch(app_manager.RyuApp):
 
             if time.time() - self.start_time > self.LLDP_INTERVAL:
                 self.LINK_DISCOVERY = False
-                self.logger.info("Link discovery complete at time: %s", time.time() - self.start_time)
+                self.logger.info("Link discovery complete at time(sec): %s", time.time() - self.start_time)
                 self.create_shortest_path_tree()
                 self.lldp_thread = None
                 break
@@ -173,7 +173,7 @@ class ShortestPathSwitch(app_manager.RyuApp):
 
             if key in self.lldp_delay:
                 delay = time.time() - self.lldp_delay[key]
-                self.logger.info(f"One-way delay from Switch {chassis_id} to Switch {datapath.id}: {delay:.6f} seconds")
+                self.logger.info(f"One-way delay from Switch {chassis_id} to Switch {datapath.id}: {1000 * delay:.6f} milliseconds")
                 self.topology[chassis_id][datapath.id] = delay
 
 
@@ -185,6 +185,9 @@ class ShortestPathSwitch(app_manager.RyuApp):
         for src in self.topology:
             self.paths[src] = self.dijkstra(src)
         self.discovery_complete = True
+
+        # Print the shortest paths
+        self.print_shortest_paths()
 
     def dijkstra(self, src):
         """Dijkstra's algorithm to compute shortest paths."""
@@ -201,7 +204,10 @@ class ShortestPathSwitch(app_manager.RyuApp):
                 continue
 
             for neighbor in self.topology[current_node]:
-                distance = current_distance + self.topology[current_node][neighbor]
+                weight = self.topology[current_node][neighbor]
+                if weight is None:
+                    continue  # Skip if delay not measured yet
+                distance = current_distance + weight
                 if distance < distances[neighbor]:
                     distances[neighbor] = distance
                     previous[neighbor] = current_node
@@ -211,8 +217,18 @@ class ShortestPathSwitch(app_manager.RyuApp):
         for dest in self.topology:
             if distances[dest] < float('inf'):
                 path = self.build_path(previous, dest)
-                paths[dest] = path
+                paths[dest] = (path, distances[dest])
         return paths
+
+    def print_shortest_paths(self):
+        """Print the shortest paths between all pairs of switches."""
+        self.logger.info("\nShortest paths between all pairs of switches:")
+        for src in sorted(self.paths.keys()):
+            for dest in sorted(self.paths[src].keys()):
+                if src != dest:
+                    path, total_delay = self.paths[src][dest]
+                    self.logger.info(f"Shortest path from Switch {src} to Switch {dest}: {path} with total delay {100*total_delay:.6f} miliseconds")
+
 
     def build_path(self, previous, dest):
         """Build the path based on Dijkstra's output."""
