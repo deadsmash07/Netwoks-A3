@@ -9,3 +9,7 @@ to run the ryu app
 ```bash
 ryu-manager sp_switch.py
 ```
+to analyse, run on separate terminal 
+```bash
+sudo ovs-ofctl dump-flows s1 -O OpenFlow13
+```
