@@ -3,10 +3,9 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
-from ryu.topology import event
 from ryu.topology import switches
 from ryu.lib.packet import packet, ethernet, lldp, ether_types, arp
-from ryu.topology.api import get_all_switch, get_all_link, get_all_host
+from ryu.topology.api import get_all_switch
 from collections import defaultdict
 from ryu.lib import hub
 import time
@@ -31,7 +30,6 @@ class ShortestPathSwitch(app_manager.RyuApp):
         self.discovery_complete = False
         self.start_time = time.time()
         self.lldp_thread = None
-        self.LINK_DISCOVERY = True
 
         self.link_to_port = {}  # For storing port mappings between switches
 
@@ -49,6 +47,7 @@ class ShortestPathSwitch(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
+        """Handle switch features reply and install table-miss flow entry."""
         datapath = ev.msg.datapath
         self.datapaths[datapath.id] = datapath
         # Install table-miss flow entry
@@ -84,7 +83,6 @@ class ShortestPathSwitch(app_manager.RyuApp):
             hub.sleep(self.LLDP_PERIOD)
 
             if time.time() - self.start_time > self.LLDP_INTERVAL:
-                self.LINK_DISCOVERY = False
                 self.logger.info("Link discovery complete at time(sec): %s",
                                  time.time() - self.start_time)
                 self.create_shortest_path_tree()
@@ -140,7 +138,7 @@ class ShortestPathSwitch(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        """Handle incoming packets, including LLDP packets for delay measurement."""
+        """Handle incoming packets, including LLDP and ARP packets."""
         msg = ev.msg
         datapath = msg.datapath
         pkt = packet.Packet(msg.data)
@@ -151,9 +149,38 @@ class ShortestPathSwitch(app_manager.RyuApp):
             self.handle_lldp_packet(msg, pkt)
             return
 
-        # Handle ARP and other traffic after discovery is complete
+        # Ignore IPv6 multicast packets (destination MAC starting with 33:33)
+        if eth.dst.startswith('33:33'):
+            # These are IPv6 multicast packets; we can choose to flood or drop them
+            # For now, we'll ignore them
+            return
+
+        src_mac = eth.src
+        dst_mac = eth.dst
+        dpid = datapath.id
+        in_port = msg.match['in_port']
+
+        # Ignore packets with invalid MAC addresses
+        if src_mac == 'ff:ff:ff:ff:ff:ff':
+            return
+
+        # Learn the source MAC address
+        self.mac_to_port.setdefault(dpid, {})
+        self.mac_to_port[dpid][src_mac] = in_port
+
+        # Add source host to hosts mapping if not already present
+        if src_mac not in self.hosts or self.hosts[src_mac][0] is None:
+            self.hosts[src_mac] = (dpid, in_port)
+            self.logger.info(f"Learned MAC {src_mac} on Switch {dpid}, Port {in_port}")
+
+        if eth.ethertype == ether_types.ETH_TYPE_ARP:
+            # Handle ARP packets separately
+            self.handle_arp(msg, pkt)
+            return
+
+        # Handle traffic after discovery is complete
         if self.discovery_complete:
-            self.handle_packet_in(msg, pkt)
+            self.handle_unicast(msg, pkt)
 
     def handle_lldp_packet(self, msg, pkt):
         """Process LLDP packet and calculate the one-way link delay."""
@@ -195,6 +222,162 @@ class ShortestPathSwitch(app_manager.RyuApp):
                 self.link_to_port[chassis_id][datapath.id] = (port_id, in_port)  # (src_port, dst_port)
                 self.link_to_port.setdefault(datapath.id, {})
                 self.link_to_port[datapath.id][chassis_id] = (in_port, port_id)
+
+    def handle_arp(self, msg, pkt):
+        """Handle ARP packets to prevent continuous flooding."""
+        datapath = msg.datapath
+        dpid = datapath.id
+        in_port = msg.match['in_port']
+        eth = pkt.get_protocol(ethernet.ethernet)
+        arp_pkt = pkt.get_protocol(arp.arp)
+
+        src_mac = eth.src
+        dst_mac = eth.dst
+        src_ip = arp_pkt.src_ip
+        dst_ip = arp_pkt.dst_ip
+
+        # Learn the source MAC and IP
+        self.hosts[src_mac] = (dpid, in_port)
+
+        # Check if we know the destination MAC for the requested IP
+        dst_mac_known = False
+        for mac, (dpid_dst, port_dst) in self.hosts.items():
+            if mac != src_mac and mac != 'ff:ff:ff:ff:ff:ff':
+                # Assuming unique MAC addresses for hosts
+                dst_mac_known = True
+                break
+
+        if dst_mac_known and self.discovery_complete:
+            # Install flow entries for ARP packets
+            self.install_arp_flow(datapath)
+            # Forward the ARP packet along the path
+            self.handle_unicast(msg, pkt)
+        else:
+            # Flood the ARP packet
+            self.logger.info(f"Flooding ARP packet from {src_mac} at Switch {dpid}")
+            out_port = datapath.ofproto.OFPP_FLOOD
+            actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
+            out = datapath.ofproto_parser.OFPPacketOut(
+                datapath=datapath, buffer_id=datapath.ofproto.OFP_NO_BUFFER,
+                in_port=in_port, actions=actions, data=msg.data)
+            datapath.send_msg(out)
+
+    def install_arp_flow(self, datapath):
+        """Install flow entries to handle ARP packets."""
+        parser = datapath.ofproto_parser
+        match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_ARP)
+        actions = [parser.OFPActionOutput(datapath.ofproto.OFPP_CONTROLLER)]
+        self.add_flow(datapath, 1, match, actions)
+
+    def handle_unicast(self, msg, pkt):
+        """Handle unicast packets after shortest paths are computed."""
+        eth = pkt.get_protocol(ethernet.ethernet)
+        dst = eth.dst
+        src = eth.src
+        dpid = msg.datapath.id
+        in_port = msg.match['in_port']
+
+        # Ignore multicast destination MAC addresses
+        if self.is_multicast_mac(dst):
+            # Handle multicast packets accordingly
+            # For simplicity, we'll flood multicast packets
+            self.logger.info(f"Flooding multicast packet from {src} to {dst} at Switch {dpid}")
+            out_port = msg.datapath.ofproto.OFPP_FLOOD
+
+            actions = [msg.datapath.ofproto_parser.OFPActionOutput(out_port)]
+            out = msg.datapath.ofproto_parser.OFPPacketOut(
+                datapath=msg.datapath, buffer_id=msg.buffer_id,
+                in_port=in_port, actions=actions, data=msg.data)
+            msg.datapath.send_msg(out)
+            return
+
+        self.mac_to_port.setdefault(dpid, {})
+
+        # Learn the source MAC address
+        self.mac_to_port[dpid][src] = in_port
+
+        # Add source host to hosts mapping if not already present
+        if src not in self.hosts or self.hosts[src][0] is None:
+            self.hosts[src] = (dpid, in_port)
+            self.logger.info(f"Learned MAC {src} on Switch {dpid}, Port {in_port}")
+
+        # Learn the destination MAC address if possible
+        if dst not in self.hosts:
+            # Destination host not known yet; add it with unknown location
+            self.hosts[dst] = (None, None)
+            self.logger.info(f"Destination MAC {dst} is unknown, added to hosts with unknown location")
+
+        dst_info = self.hosts.get(dst)
+        if dst_info and dst_info[0] is not None:
+            dst_dpid, dst_port = dst_info
+            path_info = self.paths.get(dpid, {}).get(dst_dpid)
+            if path_info:
+                path = path_info[0]  # Get the path list
+                self.logger.info(f"Installing path from {src} to {dst}: {path}")
+                # Install flow entries along the path (both directions)
+                self.install_path(path, src, dst)
+                # Determine the next hop and output port
+                if dpid == dst_dpid:
+                    out_port = dst_port
+                else:
+                    next_hop = path[path.index(dpid) + 1]
+                    out_port = self.link_to_port[dpid][next_hop][0]  # Port to next hop
+            else:
+                self.logger.warning(f"No path from Switch {dpid} to Switch {dst_dpid}")
+                out_port = msg.datapath.ofproto.OFPP_FLOOD
+                self.logger.info(f"Flooding packet from {src} to {dst} at Switch {dpid} (no path found)")
+        else:
+            # Destination MAC unknown or not learned yet, flood the packet
+            self.logger.info(f"Flooding packet from {src} to {dst} at Switch {dpid} (destination unknown)")
+            out_port = msg.datapath.ofproto.OFPP_FLOOD
+
+        actions = [msg.datapath.ofproto_parser.OFPActionOutput(out_port)]
+        out = msg.datapath.ofproto_parser.OFPPacketOut(
+            datapath=msg.datapath, buffer_id=msg.buffer_id,
+            in_port=in_port, actions=actions, data=msg.data)
+        msg.datapath.send_msg(out)
+
+    def install_path(self, path, src_mac, dst_mac):
+        """Install flow entries along the path (both directions)."""
+
+        # Install forward path (from src to dst)
+        self.logger.info(f"Installing forward path from {src_mac} to {dst_mac}: {path}")
+        for i in range(len(path) - 1):
+            curr_switch = path[i]
+            next_switch = path[i + 1]
+            datapath = self.datapaths[curr_switch]
+            out_port = self.link_to_port[curr_switch][next_switch][0]  # Port to next hop
+            match = datapath.ofproto_parser.OFPMatch(eth_dst=dst_mac)
+            actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
+            self.add_flow(datapath, 1, match, actions)
+
+        # Handle the last switch in the path (destination switch)
+        dest_switch = path[-1]
+        datapath = self.datapaths[dest_switch]
+        dst_port = self.hosts[dst_mac][1] if self.hosts[dst_mac][1] else datapath.ofproto.OFPP_FLOOD
+        match = datapath.ofproto_parser.OFPMatch(eth_dst=dst_mac)
+        actions = [datapath.ofproto_parser.OFPActionOutput(dst_port)]
+        self.add_flow(datapath, 1, match, actions)
+
+        # Install reverse path (from dst to src)
+        reverse_path = list(reversed(path))
+        self.logger.info(f"Installing reverse path from {dst_mac} to {src_mac}: {reverse_path}")
+        for i in range(len(reverse_path) - 1):
+            curr_switch = reverse_path[i]
+            next_switch = reverse_path[i + 1]
+            datapath = self.datapaths[curr_switch]
+            out_port = self.link_to_port[curr_switch][next_switch][0]  # Port to next hop
+            match = datapath.ofproto_parser.OFPMatch(eth_dst=src_mac)
+            actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
+            self.add_flow(datapath, 1, match, actions)
+
+        # Handle the last switch in the reverse path (source switch)
+        src_switch = reverse_path[-1]
+        datapath = self.datapaths[src_switch]
+        src_port = self.hosts[src_mac][1] if self.hosts[src_mac][1] else datapath.ofproto.OFPP_FLOOD
+        match = datapath.ofproto_parser.OFPMatch(eth_dst=src_mac)
+        actions = [datapath.ofproto_parser.OFPActionOutput(src_port)]
+        self.add_flow(datapath, 1, match, actions)
 
     def create_shortest_path_tree(self):
         """Compute shortest paths using Dijkstra's algorithm based on LLDP delays."""
@@ -256,65 +439,7 @@ class ShortestPathSwitch(app_manager.RyuApp):
             dest = previous[dest]
         return path
 
-    def handle_packet_in(self, msg, pkt):
-        """Handle incoming packets after shortest paths are computed."""
-        eth = pkt.get_protocol(ethernet.ethernet)
-        dst = eth.dst
-        src = eth.src
-        dpid = msg.datapath.id
-        in_port = msg.match['in_port']
-
-        self.mac_to_port.setdefault(dpid, {})
-
-        # Learn the MAC address
-        self.mac_to_port[dpid][src] = in_port
-
-        # Add source host to hosts mapping if not already present
-        if src not in self.hosts:
-            self.hosts[src] = (dpid, in_port)
-
-        if dst in self.hosts:
-            dst_dpid, dst_port = self.hosts[dst]
-            path_info = self.paths.get(dpid, {}).get(dst_dpid)
-            if path_info:
-                path = path_info[0]  # Get the path list
-                self.logger.info(f"Installing path from {src} to {dst}: {path}")
-                # Install flow entries along the path
-                self.install_path(path, src, dst)
-                # Determine the next hop and output port
-                if dpid == dst_dpid:
-                    out_port = dst_port
-                else:
-                    next_hop = path[path.index(dpid) + 1]
-                    out_port = self.link_to_port[dpid][next_hop][0]  # Port to next hop
-            else:
-                self.logger.warning(f"No path from Switch {dpid} to Switch {dst_dpid}")
-                out_port = msg.datapath.ofproto.OFPP_FLOOD
-        else:
-            # Destination MAC unknown, flood the packet
-            out_port = msg.datapath.ofproto.OFPP_FLOOD
-
-        actions = [msg.datapath.ofproto_parser.OFPActionOutput(out_port)]
-        out = msg.datapath.ofproto_parser.OFPPacketOut(
-            datapath=msg.datapath, buffer_id=msg.buffer_id,
-            in_port=in_port, actions=actions, data=msg.data)
-        msg.datapath.send_msg(out)
-
-    def install_path(self, path, src_mac, dst_mac):
-        """Install flow entries along the path."""
-        for i in range(len(path) - 1):
-            curr_switch = path[i]
-            next_switch = path[i + 1]
-            datapath = self.datapaths[curr_switch]
-            out_port = self.link_to_port[curr_switch][next_switch][0]  # Port to next hop
-            match = datapath.ofproto_parser.OFPMatch(eth_dst=dst_mac)
-            actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
-            self.add_flow(datapath, 1, match, actions)
-
-        # Install flow entry on the destination switch
-        dest_switch = path[-1]
-        datapath = self.datapaths[dest_switch]
-        dst_port = self.hosts[dst_mac][1]
-        match = datapath.ofproto_parser.OFPMatch(eth_dst=dst_mac)
-        actions = [datapath.ofproto_parser.OFPActionOutput(dst_port)]
-        self.add_flow(datapath, 1, match, actions)
+    def is_multicast_mac(self, mac_address):
+        """Check if a MAC address is a multicast address."""
+        first_octet = int(mac_address.split(":")[0], 16)
+        return (first_octet & 1) == 1

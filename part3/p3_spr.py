@@ -3,12 +3,14 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
+from ryu.topology import event
 from ryu.topology import switches
 from ryu.lib.packet import packet, ethernet, lldp, ether_types, arp
-from ryu.topology.api import get_all_switch
+from ryu.topology.api import get_all_switch, get_all_link, get_all_host
 from collections import defaultdict
 from ryu.lib import hub
 import time
+
 
 class ShortestPathSwitch(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -21,16 +23,17 @@ class ShortestPathSwitch(app_manager.RyuApp):
     def __init__(self, *args, **kwargs):
         super(ShortestPathSwitch, self).__init__(*args, **kwargs)
         self.datapaths = {}
-        self.mac_to_port = {}  # Mapping of switch DPID to {MAC: port}
+        self.mac_to_port = {}
         self.topology_api_app = kwargs['topology_api_app']
-        self.topology = defaultdict(dict)  # Nested dict to store link info
-        self.hosts = {}  # Mapping of host MAC to (switch DPID, port)
+        self.topology = defaultdict(dict)
+        self.hosts = {}
         self.lldp_delay = {}  # To store LLDP timestamps for delay calculation
-        self.link_to_port = {}  # Mapping of links to ports: {(src_dpid, dst_dpid): (src_port, dst_port)}
         self.discovery_complete = False
         self.start_time = time.time()
         self.lldp_thread = None
         self.LINK_DISCOVERY = True
+
+        self.link_to_port = {}  # For storing port mappings between switches
 
         # Start LLDP measurement after waiting for 10 seconds to allow topology discovery
         self.monitor_thread = hub.spawn(self._wait_for_discovery)
@@ -46,21 +49,22 @@ class ShortestPathSwitch(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
-        """Handle switch features reply and install table-miss flow entry."""
         datapath = ev.msg.datapath
         self.datapaths[datapath.id] = datapath
         # Install table-miss flow entry
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
         match = parser.OFPMatch()
-        actions = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
+        actions = [parser.OFPActionOutput(
+            ofproto.OFPP_CONTROLLER, ofproto.OFPCML_NO_BUFFER)]
         self.add_flow(datapath, 0, match, actions)
 
     def add_flow(self, datapath, priority, match, actions, buffer_id=None):
-        """Add a flow entry to the switch."""
+        """Install a flow entry on the switch."""
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
-        inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
+        inst = [parser.OFPInstructionActions(
+            ofproto.OFPIT_APPLY_ACTIONS, actions)]
         if buffer_id and buffer_id != ofproto.OFP_NO_BUFFER:
             mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id, priority=priority,
                                     match=match, instructions=inst)
@@ -72,7 +76,8 @@ class ShortestPathSwitch(app_manager.RyuApp):
     def _send_lldp_packets(self):
         """LLDP packet sending thread for link delay measurement."""
         while True:
-            self.logger.info(f"Sending LLDP packets at time {time.time() - self.start_time}")
+            self.logger.info(
+                f"Sending LLDP packets at time {time.time() - self.start_time}")
             switches = get_all_switch(self.topology_api_app)
             for switch in switches:
                 self.send_lldp(switch.dp)
@@ -80,7 +85,8 @@ class ShortestPathSwitch(app_manager.RyuApp):
 
             if time.time() - self.start_time > self.LLDP_INTERVAL:
                 self.LINK_DISCOVERY = False
-                self.logger.info("Link discovery complete at time(sec): %s", time.time() - self.start_time)
+                self.logger.info("Link discovery complete at time(sec): %s",
+                                 time.time() - self.start_time)
                 self.create_shortest_path_tree()
                 self.lldp_thread = None
                 break
@@ -139,37 +145,21 @@ class ShortestPathSwitch(app_manager.RyuApp):
         datapath = msg.datapath
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocols(ethernet.ethernet)[0]
-        dpid = datapath.id
-        in_port = msg.match['in_port']
 
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             # Process LLDP packets for delay calculation
             self.handle_lldp_packet(msg, pkt)
             return
 
-        # Ignore IPv6 multicast packets (e.g., MLD packets)
-        if eth.dst.startswith('33:33'):
-            return
-
-        # Learn the source MAC address to avoid FLOOD next time
-        self.mac_to_port.setdefault(dpid, {})
-        self.mac_to_port[dpid][eth.src] = in_port
-
-        # Add host to self.hosts if not already known
-        if eth.src not in self.hosts:
-            self.hosts[eth.src] = (dpid, in_port)
-            self.logger.info(f"Host {eth.src} is attached to Switch {dpid}, Port {in_port}")
-
-        # Handle packets after discovery is complete
+        # Handle ARP and other traffic after discovery is complete
         if self.discovery_complete:
             self.handle_packet_in(msg, pkt)
 
     def handle_lldp_packet(self, msg, pkt):
         """Process LLDP packet and calculate the one-way link delay."""
         datapath = msg.datapath
-        dpid = datapath.id
-        in_port = msg.match['in_port']
         lldp_pkt = pkt.get_protocol(lldp.lldp)
+        in_port = msg.match['in_port']
 
         chassis_id = None
         port_id = None
@@ -190,18 +180,21 @@ class ShortestPathSwitch(app_manager.RyuApp):
                     port_id = int(port_id_str[5:])
 
         if chassis_id is not None and port_id is not None:
-            src_dpid = chassis_id
-            src_port = port_id
-            dst_dpid = dpid
-            dst_port = in_port
-            key = (src_dpid, src_port)
+            key = (chassis_id, port_id)
 
             if key in self.lldp_delay:
                 delay = time.time() - self.lldp_delay[key]
-                self.logger.info(f"One-way delay from Switch {src_dpid} to Switch {dst_dpid}: {1000 * delay:.6f} milliseconds")
-                # Store link information with delay and port numbers
-                self.topology[src_dpid][dst_dpid] = {'delay': delay, 'src_port': src_port, 'dst_port': dst_port}
-                self.link_to_port[(src_dpid, dst_dpid)] = (src_port, dst_port)
+                self.logger.info(
+                    f"One-way delay from Switch {chassis_id} to Switch {datapath.id}: {1000 * delay:.6f} milliseconds")
+                # Store the delay
+                self.topology[chassis_id][datapath.id] = delay
+                self.topology[datapath.id][chassis_id] = delay  # Assuming symmetric delay
+
+                # Store the port mappings
+                self.link_to_port.setdefault(chassis_id, {})
+                self.link_to_port[chassis_id][datapath.id] = (port_id, in_port)  # (src_port, dst_port)
+                self.link_to_port.setdefault(datapath.id, {})
+                self.link_to_port[datapath.id][chassis_id] = (in_port, port_id)
 
     def create_shortest_path_tree(self):
         """Compute shortest paths using Dijkstra's algorithm based on LLDP delays."""
@@ -229,9 +222,10 @@ class ShortestPathSwitch(app_manager.RyuApp):
                 continue
 
             for neighbor in self.topology[current_node]:
-                link_info = self.topology[current_node][neighbor]
-                delay = link_info['delay']
-                distance = current_distance + delay
+                weight = self.topology[current_node][neighbor]
+                if weight is None:
+                    continue  # Skip if delay not measured yet
+                distance = current_distance + weight
                 if distance < distances[neighbor]:
                     distances[neighbor] = distance
                     previous[neighbor] = current_node
@@ -241,7 +235,7 @@ class ShortestPathSwitch(app_manager.RyuApp):
         for dest in self.topology:
             if distances[dest] < float('inf'):
                 path = self.build_path(previous, dest)
-                paths[dest] = path
+                paths[dest] = (path, distances[dest])
         return paths
 
     def print_shortest_paths(self):
@@ -250,9 +244,9 @@ class ShortestPathSwitch(app_manager.RyuApp):
         for src in sorted(self.paths.keys()):
             for dest in sorted(self.paths[src].keys()):
                 if src != dest:
-                    path = self.paths[src][dest]
-                    total_delay = sum(self.topology[path[i]][path[i + 1]]['delay'] for i in range(len(path) - 1))
-                    self.logger.info(f"Shortest path from Switch {src} to Switch {dest}: {path} with total delay {1000 * total_delay:.6f} milliseconds")
+                    path, total_delay = self.paths[src][dest]
+                    self.logger.info(
+                        f"Shortest path from Switch {src} to Switch {dest}: {path} with total delay {1000 * total_delay:.6f} milliseconds")
 
     def build_path(self, previous, dest):
         """Build the path based on Dijkstra's output."""
@@ -267,71 +261,60 @@ class ShortestPathSwitch(app_manager.RyuApp):
         eth = pkt.get_protocol(ethernet.ethernet)
         dst = eth.dst
         src = eth.src
-        datapath = msg.datapath
-        dpid = datapath.id
+        dpid = msg.datapath.id
         in_port = msg.match['in_port']
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
 
-        # If destination MAC is known, compute path
+        self.mac_to_port.setdefault(dpid, {})
+
+        # Learn the MAC address
+        self.mac_to_port[dpid][src] = in_port
+
+        # Add source host to hosts mapping if not already present
+        if src not in self.hosts:
+            self.hosts[src] = (dpid, in_port)
+
         if dst in self.hosts:
             dst_dpid, dst_port = self.hosts[dst]
-            path = self.paths.get(dpid, {}).get(dst_dpid)
-            if path:
+            path_info = self.paths.get(dpid, {}).get(dst_dpid)
+            if path_info:
+                path = path_info[0]  # Get the path list
+                self.logger.info(f"Installing path from {src} to {dst}: {path}")
                 # Install flow entries along the path
                 self.install_path(path, src, dst)
-                # Get the next hop in the path and the output port
-                if dpid != dst_dpid:
-                    next_hop = path[path.index(dpid) + 1]
-                    out_port = self.link_to_port[(dpid, next_hop)][0]
-                else:
-                    # If the packet is already at the destination switch
+                # Determine the next hop and output port
+                if dpid == dst_dpid:
                     out_port = dst_port
+                else:
+                    next_hop = path[path.index(dpid) + 1]
+                    out_port = self.link_to_port[dpid][next_hop][0]  # Port to next hop
             else:
-                out_port = ofproto.OFPP_FLOOD
+                self.logger.warning(f"No path from Switch {dpid} to Switch {dst_dpid}")
+                out_port = msg.datapath.ofproto.OFPP_FLOOD
         else:
-            out_port = ofproto.OFPP_FLOOD
+            # Destination MAC unknown, flood the packet
+            out_port = msg.datapath.ofproto.OFPP_FLOOD
 
-        # Send packet out
-        actions = [parser.OFPActionOutput(out_port)]
-        out = parser.OFPPacketOut(
-            datapath=datapath, buffer_id=msg.buffer_id,
+        actions = [msg.datapath.ofproto_parser.OFPActionOutput(out_port)]
+        out = msg.datapath.ofproto_parser.OFPPacketOut(
+            datapath=msg.datapath, buffer_id=msg.buffer_id,
             in_port=in_port, actions=actions, data=msg.data)
-        datapath.send_msg(out)
+        msg.datapath.send_msg(out)
 
     def install_path(self, path, src_mac, dst_mac):
         """Install flow entries along the path."""
         for i in range(len(path) - 1):
-            dpid = path[i]
-            next_dpid = path[i + 1]
-            datapath = self.datapaths[dpid]
-            ofproto = datapath.ofproto
-            parser = datapath.ofproto_parser
-
-            # Get the output port to the next switch
-            out_port = self.link_to_port[(dpid, next_dpid)][0]
-            # Get the input port from the previous switch
-            if i == 0:
-                in_port = self.mac_to_port[dpid][src_mac]
-            else:
-                prev_dpid = path[i - 1]
-                in_port = self.link_to_port[(dpid, prev_dpid)][1]
-
-            # Install flow entry
-            match = parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
-            actions = [parser.OFPActionOutput(out_port)]
+            curr_switch = path[i]
+            next_switch = path[i + 1]
+            datapath = self.datapaths[curr_switch]
+            out_port = self.link_to_port[curr_switch][next_switch][0]  # Port to next hop
+            match = datapath.ofproto_parser.OFPMatch(eth_dst=dst_mac)
+            actions = [datapath.ofproto_parser.OFPActionOutput(out_port)]
             self.add_flow(datapath, 1, match, actions)
 
         # Install flow entry on the destination switch
-        dst_dpid = path[-1]
-        datapath = self.datapaths[dst_dpid]
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        out_port = self.mac_to_port[dst_dpid][dst_mac]
-        if len(path) > 1:
-            in_port = self.link_to_port[(dst_dpid, path[-2])][1]
-        else:
-            in_port = self.mac_to_port[dst_dpid][src_mac]
-        match = parser.OFPMatch(in_port=in_port, eth_src=src_mac, eth_dst=dst_mac)
-        actions = [parser.OFPActionOutput(out_port)]
+        dest_switch = path[-1]
+        datapath = self.datapaths[dest_switch]
+        dst_port = self.hosts[dst_mac][1]
+        match = datapath.ofproto_parser.OFPMatch(eth_dst=dst_mac)
+        actions = [datapath.ofproto_parser.OFPActionOutput(dst_port)]
         self.add_flow(datapath, 1, match, actions)
