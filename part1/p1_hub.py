@@ -30,7 +30,6 @@ class HubController(app_manager.RyuApp):
         # flooding the packet to all ports
         actions = [parser.OFPActionOutput(ofproto.OFPP_FLOOD)]
         
-        # Create the PacketOut message
         out = parser.OFPPacketOut(
             datapath=dp, buffer_id=msg.buffer_id, in_port=in_port,
             actions=actions, data=msg.data

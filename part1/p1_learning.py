@@ -24,20 +24,16 @@ class LearningSwitch(app_manager.RyuApp):
         pkt = packet.Packet(msg.data)
         eth = pkt.get_protocol(ethernet.ethernet)
 
-        # ignoring LLDP packets
         if eth.ethertype == 0x88cc:
             return
 
-        # the source and destination MAC addresses
         src = eth.src
         dst = eth.dst
         dpid = datapath.id
-
-        # learning the source MAC address to avoid flooding next time
         self.mac_to_port.setdefault(dpid, {})
         self.mac_to_port[dpid][src] = in_port
 
-        # If the destination MAC is known, forward the packet to the correct port
+        # if the destination MAC is known, forward the packet to the correct port
         if dst in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst]
         else:

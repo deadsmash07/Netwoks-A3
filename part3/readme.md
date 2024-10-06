@@ -7,7 +7,7 @@ sudo mn --custom p3_topo.py --topo customtopo3 --controller=remote,ip=127.0.0.1,
 
 to run the ryu app
 ```bash
-ryu-manager p3_spr.py
+ryu-manager --observe-links p3_spr.py
 ```
 to analyse, run on separate terminal 
 ```bash
