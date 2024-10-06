@@ -20,9 +20,12 @@ class SpanningTreeSwitch(app_manager.RyuApp):
         self.spanning_tree = {}
         self.datapaths = {}
         self.topology = {}
+        self.host_ports = {}  # To store ports connected to hosts
         self.spanning_tree_computed = False
         self.topology_api_app = kwargs['topology_api_app']
-        self.lock = hub.Event()  # This can be removed if not used elsewhere
+
+        # Start a 10 second timer to compute the spanning tree
+        hub.spawn_after(10, self.compute_spanning_tree)
 
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features_handler(self, ev):
@@ -40,35 +43,28 @@ class SpanningTreeSwitch(app_manager.RyuApp):
         self.datapaths[dpid] = datapath
         self.logger.info(f"Switch {dpid} connected.")
 
-    def add_flow(self, datapath, priority, match, actions, table_id=0, buffer_id=None):
+    def add_flow(self, datapath, priority, match, actions, buffer_id=None):
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
-        # Construct flow mod message
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
 
         if buffer_id:
-            mod = parser.OFPFlowMod(
-                datapath=datapath, buffer_id=buffer_id, priority=priority,
-                match=match, instructions=inst, table_id=table_id)
+            mod = parser.OFPFlowMod(datapath=datapath, buffer_id=buffer_id, priority=priority,
+                                    match=match, instructions=inst)
         else:
-            mod = parser.OFPFlowMod(
-                datapath=datapath, priority=priority, match=match,
-                instructions=inst, table_id=table_id)
+            mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
+                                    match=match, instructions=inst)
         datapath.send_msg(mod)
 
-    @set_ev_cls(event.EventSwitchEnter)
-    @set_ev_cls(event.EventLinkAdd)
-    def _topology_discovered(self, ev):
-        """Wait a few seconds after link discovery before computing the spanning tree"""
-        if not self.spanning_tree_computed:
-            hub.spawn_after(5, self.compute_spanning_tree)
-
     def compute_spanning_tree(self):
-        self.logger.info("Computing spanning tree...")
+        self.logger.info("Computing spanning tree after waiting for 10 seconds...")
         switches = get_all_switch(self.topology_api_app)
         links = get_all_link(self.topology_api_app)
         hosts = get_all_host(self.topology_api_app)
+
+        # Store the ports that connect to hosts for forwarding later
+        self.store_host_ports(hosts)
 
         self.logger.info(f"Discovered Switches: {[s.dp.id for s in switches]}")
         self.logger.info(f"Discovered Links: {[(l.src.dpid, l.dst.dpid) for l in links]}")
@@ -81,7 +77,7 @@ class SpanningTreeSwitch(app_manager.RyuApp):
         self.topology.clear()
         self.spanning_tree.clear()
 
-        # Build the network graph
+        # Build the network graph using only switches and links between switches
         for link in links:
             s1 = link.src.dpid
             s2 = link.dst.dpid
@@ -90,29 +86,23 @@ class SpanningTreeSwitch(app_manager.RyuApp):
             self.topology.setdefault(s1, []).append((s2, src_port, dst_port))
             self.topology.setdefault(s2, []).append((s1, dst_port, src_port))
 
-        for host in hosts:
-            host_mac = host.mac
-            host_port = host.port.port_no
-            dpid = host.port.dpid
-            self.topology.setdefault(dpid, []).append((host_mac, host_port, None))
-
+        # Choose the switch with the lowest DPID as root
         visited = set()
-        root = min(self.topology.keys())  # Choose the switch with the lowest DPID as root
+        root = min(self.topology.keys())
         self.logger.info(f"Root of Spanning Tree: Switch {root}")
 
+        # BFS to compute the spanning tree
         queue = deque([root])
         visited.add(root)
 
         while queue:
             node = queue.popleft()
             for neighbor, src_port, dst_port in self.topology[node]:
-                if isinstance(neighbor, int) and neighbor not in visited:  # Handle switch neighbors
+                if isinstance(neighbor, int) and neighbor not in visited:
                     visited.add(neighbor)
                     self.spanning_tree.setdefault(node, []).append((neighbor, src_port))
                     self.spanning_tree.setdefault(neighbor, []).append((node, dst_port))
                     queue.append(neighbor)
-                elif not isinstance(neighbor, int):  # Handle host neighbors
-                    self.spanning_tree.setdefault(node, []).append((neighbor, src_port))
 
         self.spanning_tree_computed = True
         self.logger.info("Spanning Tree Computed:")
@@ -121,6 +111,14 @@ class SpanningTreeSwitch(app_manager.RyuApp):
 
         # Install flow entries to block non-spanning tree links
         self.install_spanning_tree_flows()
+
+    def store_host_ports(self, hosts):
+        """Store the ports where hosts are connected."""
+        for host in hosts:
+            host_mac = host.mac
+            host_port = host.port.port_no
+            dpid = host.port.dpid
+            self.host_ports.setdefault(dpid, []).append((host_mac, host_port))
 
     def install_spanning_tree_flows(self):
         for dpid, datapath in self.datapaths.items():
@@ -151,7 +149,7 @@ class SpanningTreeSwitch(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev):
-        # Implement packet handling logic here, such as MAC learning
+        # Extract packet information
         msg = ev.msg
         datapath = msg.datapath
         ofproto = datapath.ofproto
@@ -177,17 +175,17 @@ class SpanningTreeSwitch(app_manager.RyuApp):
         if dst in self.mac_to_port[dpid]:
             out_port = self.mac_to_port[dpid][dst]
         else:
-            # Flood if destination is unknown
+            # Fallback to flooding if destination MAC is not in the MAC table
             out_port = ofproto.OFPP_FLOOD
 
         actions = [parser.OFPActionOutput(out_port)]
 
-        # Install flow to avoid packet_in next time
+        # Install flow to avoid packet_in next time if the out_port is not flood
         if out_port != ofproto.OFPP_FLOOD:
             match = parser.OFPMatch(in_port=in_port, eth_dst=dst, eth_src=src)
             self.add_flow(datapath, 1, match, actions)
 
-        # Send packet out
+        # Send the packet out
         out = parser.OFPPacketOut(
             datapath=datapath, buffer_id=msg.buffer_id,
             in_port=in_port, actions=actions, data=msg.data)
